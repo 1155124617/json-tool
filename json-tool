@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""
+json-tool — Lightweight JSON reader/editor CLI for agents.
+
+Supports:
+  read   <file> <path>            Read a JSON node by path
+  edit   <file> <path> <value>    Edit a JSON node (auto-detects type)
+  delete <file> <path>             Delete a JSON node
+  add    <file> <path> <value>     Add/insert a JSON node
+  type   <file> <path>             Show the type of a JSON node
+
+Path syntax: dot-notation with optional brackets
+  users[0].name        → {"users": [{"name": ...}]}
+  config.debug         → {"config": {"debug": ...}}
+  data.items[-1]       → last element of data.items array
+
+Values are parsed intelligently:
+  42          → number
+  true/false → boolean
+  null       → null
+  "str"      → string (with quotes)
+  {...}      → object (JSON)
+  [...]      → array (JSON)
+  (anything else is treated as string literal)
+"""
+
+import json
+import sys
+import re
+from typing import Any, Optional
+
+
+def _parse_path(path: str) -> list:
+    """Parse dot/bracket path into list of keys/indices."""
+    if not path or path == ".":
+        return []
+    # Split on dots, but keep bracket parts together
+    parts = []
+    for segment in re.findall(r"[^.\[\]]+|\[[-?\d+\*]\]", path):
+        if segment.startswith("[") and segment.endswith("]"):
+            idx = segment[1:-1]
+            if idx == "*":
+                parts.append("*")
+            else:
+                parts.append(int(idx))
+        else:
+            parts.append(segment)
+    return parts
+
+
+def _get_node(data: Any, path_parts: list) -> Any:
+    """Traverse data following path_parts. Returns (node, parent, key) for editing."""
+    if not path_parts:
+        return data, None, None
+    current = data
+    for i, part in enumerate(path_parts[:-1]):
+        next_part = path_parts[i + 1]
+        if isinstance(current, dict):
+            if part not in current:
+                raise KeyError(f"Key '{part}' not found")
+            current = current[part]
+        elif isinstance(current, list):
+            if part == "*":
+                raise ValueError("Wildcard [*] only allowed in last position for read")
+            if not isinstance(part, int):
+                raise TypeError(f"Expected integer index for array, got '{part}'")
+            if part < 0:
+                part = len(current) + part
+            if part < 0 or part >= len(current):
+                raise IndexError(f"Index {path_parts[i]} out of range (len={len(current)})")
+            current = current[part]
+        else:
+            raise TypeError(f"Cannot traverse into {type(current).__name__} at '{part}'")
+    
+    last = path_parts[-1]
+    if isinstance(current, dict):
+        if last not in current:
+            raise KeyError(f"Key '{last}' not found")
+        return current[last], current, last
+    elif isinstance(current, list):
+        if last == "*":
+            return current, current, "*"
+        if not isinstance(last, int):
+            raise TypeError(f"Expected integer index for array, got '{last}'")
+        if last < 0:
+            last = len(current) + last
+        if last < 0 or last >= len(current):
+            raise IndexError(f"Index {last} out of range (len={len(current)})")
+        return current[last], current, last
+    else:
+        raise TypeError(f"Cannot index into {type(current).__name__}")
+
+
+def _parse_value(value_str: str) -> Any:
+    """Intelligently parse a value string into its JSON type."""
+    value_str = value_str.strip()
+    if not value_str:
+        return ""
+    
+    # Try JSON literal first
+    try:
+        return json.loads(value_str)
+    except json.JSONDecodeError:
+        pass
+    
+    # Auto-detect common types
+    lowered = value_str.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "null":
+        return None
+    
+    # Try integer
+    try:
+        if re.match(r"^-?\d+$", value_str):
+            return int(value_str)
+    except ValueError:
+        pass
+    
+    # Try float
+    try:
+        if re.match(r"^-?\d+\.\d+([eE][+-]?\d+)?$", value_str) or \
+           re.match(r"^-?\d+[eE][+-]?\d+$", value_str):
+            return float(value_str)
+    except ValueError:
+        pass
+    
+    # Default: string
+    return value_str
+
+
+def _set_node(data: Any, path_parts: list, value: Any) -> None:
+    """Set a node at path_parts, creating intermediate dicts if needed."""
+    if not path_parts:
+        raise ValueError("Cannot set root without replacing entire file")
+    
+    current = data
+    for i, part in enumerate(path_parts[:-1]):
+        next_part = path_parts[i + 1]
+        if isinstance(current, dict):
+            if part not in current:
+                # Auto-create intermediate structure based on next part type
+                if isinstance(next_part, int) or next_part == "*":
+                    current[part] = []
+                else:
+                    current[part] = {}
+            current = current[part]
+        elif isinstance(current, list):
+            if not isinstance(part, int):
+                raise TypeError(f"Expected integer index for array, got '{part}'")
+            if part < 0:
+                part = len(current) + part
+            if part < 0 or part >= len(current):
+                raise IndexError(f"Index {part} out of range")
+            current = current[part]
+        else:
+            raise TypeError(f"Cannot traverse into {type(current).__name__} at '{part}'")
+    
+    last = path_parts[-1]
+    if isinstance(current, dict):
+        current[last] = value
+    elif isinstance(current, list):
+        if not isinstance(last, int):
+            raise TypeError(f"Expected integer index for array, got '{last}'")
+        if last < 0:
+            last = len(current) + last
+        if last == len(current):
+            current.append(value)
+        elif 0 <= last < len(current):
+            current[last] = value
+        else:
+            raise IndexError(f"Index {last} out of range (len={len(current)})")
+    else:
+        raise TypeError(f"Cannot index into {type(current).__name__}")
+
+
+def _delete_node(data: Any, path_parts: list) -> None:
+    """Delete a node at path_parts."""
+    if not path_parts:
+        raise ValueError("Cannot delete root")
+    
+    current = data
+    for i, part in enumerate(path_parts[:-1]):
+        if isinstance(current, dict):
+            if part not in current:
+                raise KeyError(f"Key '{part}' not found")
+            current = current[part]
+        elif isinstance(current, list):
+            if not isinstance(part, int):
+                raise TypeError(f"Expected integer index, got '{part}'")
+            if part < 0:
+                part = len(current) + part
+            if part < 0 or part >= len(current):
+                raise IndexError(f"Index {part} out of range")
+            current = current[part]
+        else:
+            raise TypeError(f"Cannot traverse into {type(current).__name__}")
+    
+    last = path_parts[-1]
+    if isinstance(current, dict):
+        if last not in current:
+            raise KeyError(f"Key '{last}' not found")
+        del current[last]
+    elif isinstance(current, list):
+        if not isinstance(last, int):
+            raise TypeError(f"Expected integer index, got '{last}'")
+        if last < 0:
+            last = len(current) + last
+        if 0 <= last < len(current):
+            del current[last]
+        else:
+            raise IndexError(f"Index {last} out of range")
+    else:
+        raise TypeError(f"Cannot delete from {type(current).__name__}")
+
+
+def _format_output(value: Any, compact: bool = False) -> str:
+    """Format value for output."""
+    if compact:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, indent=2, ensure_ascii=False)
+    if isinstance(value, str):
+        return value  # Return raw string, not quoted
+    return json.dumps(value, ensure_ascii=False)
+
+
+def cmd_read(args: list) -> int:
+    """Read a JSON node."""
+    if len(args) < 2:
+        print("Usage: json-tool read <file> <path>", file=sys.stderr)
+        return 1
+    
+    filepath, path = args[0], args[1]
+    
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: File not found: {filepath}", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON: {e}", file=sys.stderr)
+        return 1
+    
+    path_parts = _parse_path(path)
+    
+    try:
+        node, _, _ = _get_node(data, path_parts)
+    except (KeyError, IndexError, TypeError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    
+    print(_format_output(node, compact="--compact" in args))
+    return 0
+
+
+def cmd_edit(args: list) -> int:
+    """Edit a JSON node."""
+    if len(args) < 3:
+        print("Usage: json-tool edit <file> <path> <value>", file=sys.stderr)
+        return 1
+    
+    filepath, path, value_str = args[0], args[1], args[2]
+    value = _parse_value(value_str)
+    
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: File not found: {filepath}", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON: {e}", file=sys.stderr)
+        return 1
+    
+    path_parts = _parse_path(path)
+    
+    try:
+        _set_node(data, path_parts, value)
+    except (KeyError, IndexError, TypeError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    
+    print(f"✓ Updated {filepath} at '{path}'")
+    return 0
+
+
+def cmd_delete(args: list) -> int:
+    """Delete a JSON node."""
+    if len(args) < 2:
+        print("Usage: json-tool delete <file> <path>", file=sys.stderr)
+        return 1
+    
+    filepath, path = args[0], args[1]
+    
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: File not found: {filepath}", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON: {e}", file=sys.stderr)
+        return 1
+    
+    path_parts = _parse_path(path)
+    
+    try:
+        _delete_node(data, path_parts)
+    except (KeyError, IndexError, TypeError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    
+    print(f"✓ Deleted {filepath} at '{path}'")
+    return 0
+
+
+def cmd_add(args: list) -> int:
+    """Add/insert a JSON node (alias for edit with auto-creation)."""
+    if len(args) < 3:
+        print("Usage: json-tool add <file> <path> <value>", file=sys.stderr)
+        return 1
+    
+    filepath, path, value_str = args[0], args[1], args[2]
+    value = _parse_value(value_str)
+    
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        # Create new file with the path
+        data = {}
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON: {e}", file=sys.stderr)
+        return 1
+    
+    path_parts = _parse_path(path)
+    
+    try:
+        _set_node(data, path_parts, value)
+    except (KeyError, IndexError, TypeError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    
+    print(f"✓ Added to {filepath} at '{path}'")
+    return 0
+
+
+def cmd_type(args: list) -> int:
+    """Show the type of a JSON node."""
+    if len(args) < 2:
+        print("Usage: json-tool type <file> <path>", file=sys.stderr)
+        return 1
+    
+    filepath, path = args[0], args[1]
+    
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: File not found: {filepath}", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON: {e}", file=sys.stderr)
+        return 1
+    
+    path_parts = _parse_path(path)
+    
+    try:
+        node, _, _ = _get_node(data, path_parts)
+    except (KeyError, IndexError, TypeError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    
+    type_name = type(node).__name__
+    if node is None:
+        type_name = "null"
+    elif isinstance(node, bool):
+        type_name = "boolean"
+    elif isinstance(node, (int, float)):
+        type_name = "number"
+    
+    print(type_name)
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print(__doc__, file=sys.stderr)
+        return 1
+    
+    command = sys.argv[1].lower()
+    args = sys.argv[2:]
+    
+    commands = {
+        "read": cmd_read,
+        "get": cmd_read,
+        "edit": cmd_edit,
+        "set": cmd_edit,
+        "delete": cmd_delete,
+        "del": cmd_delete,
+        "rm": cmd_delete,
+        "add": cmd_add,
+        "type": cmd_type,
+    }
+    
+    if command not in commands:
+        print(f"Unknown command: {command}", file=sys.stderr)
+        print(f"Available: {', '.join(set(commands.keys()))}", file=sys.stderr)
+        return 1
+    
+    return commands[command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
