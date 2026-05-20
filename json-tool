@@ -36,7 +36,7 @@ def _parse_path(path: str) -> list:
         return []
     # Split on dots, but keep bracket parts together
     parts = []
-    for segment in re.findall(r"[^.\[\]]+|\[[-?\d+\*]\]", path):
+    for segment in re.findall(r"[^\.\[\]]+|\[\-?\d+\]|\[\*\]", path):
         if segment.startswith("[") and segment.endswith("]"):
             idx = segment[1:-1]
             if idx == "*":
